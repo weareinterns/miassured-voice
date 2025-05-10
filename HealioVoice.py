@@ -172,8 +172,7 @@ class AudioSessionHandler:
         self.audio_chunks = []
         self.buffer_size = 0
         self.max_buffer_size = 192000
-        self.initial_prompt = None  # Will be set after receiving config
-        self.prompt_url = PROMPT_URL  # Default prompt URL
+        self.initial_prompt = INITIAL_PROMPT  # Default prompt
         self.connection_closed = False  # Flag to track WebSocket connection state
         self.config_received = False  # Flag to track if we've received config
         
@@ -182,26 +181,14 @@ class AudioSessionHandler:
         print(f"New session created: {self.session_id}, Total active sessions: {len(active_sessions)}")
 
     async def handle_config_message(self, message_data):
-        if 'promptUrl' in message_data:
-            self.prompt_url = message_data['promptUrl']
-            print(f"[{self.session_id}] Using custom prompt URL: {self.prompt_url}")
-            self.initial_prompt = await self.load_prompt_async()
+        if 'prompt' in message_data:
+            self.initial_prompt = message_data['prompt']
+            print(f"[{self.session_id}] Using custom prompt: {len(self.initial_prompt)} characters")
             self.config_received = True
         else:
-            print(f"[{self.session_id}] No custom prompt URL provided, using default")
+            print(f"[{self.session_id}] No custom prompt provided, using default")
             self.initial_prompt = INITIAL_PROMPT
             self.config_received = True
-
-    async def load_prompt_async(self):
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(self.prompt_url) as response:
-                    prompt_text = await response.text()
-                    print(f"[{self.session_id}] Successfully loaded prompt: {len(prompt_text)} characters")
-                    return prompt_text
-        except Exception as e:
-            print(f"[{self.session_id}] Error loading prompt: {e}")
-            return INITIAL_PROMPT  # Fallback to default prompt
 
     async def start_session(self):
         try:
@@ -214,10 +201,8 @@ class AudioSessionHandler:
                         break
             except asyncio.TimeoutError:
                 print(f"[{self.session_id}] No config received, using default prompt")
-                self.initial_prompt = INITIAL_PROMPT
             except Exception as e:
                 print(f"[{self.session_id}] Error receiving config: {e}")
-                self.initial_prompt = INITIAL_PROMPT
 
             # Connect to the Gemini API using proper async with syntax
             print(f"[{self.session_id}] Connecting to Gemini API")
@@ -237,7 +222,7 @@ class AudioSessionHandler:
                             await self.session.send(input=self.initial_prompt)
                         except Exception as e2:
                             print(f"[{self.session_id}] Error sending prompt: {e2}")
-                # Send status message to client - FIX HERE: use send_text for FastAPI WebSocket
+                # Send status message to client
                 await self.safe_send_text(json.dumps({
                     "type": "status",
                     "data": f"Connected to Dr. Healio (Session: {self.session_id})"
