@@ -16,6 +16,7 @@ import random
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 import uvicorn
 import threading
+import aiohttp
 
 from google import genai
 from google.genai import types
@@ -81,6 +82,9 @@ def get_random_api_key():
 # Model and config
 MODEL = "models/gemini-2.0-flash-live-001"
 
+# Initial prompt URL
+PROMPT_URL = "https://gist.githubusercontent.com/shudveta/6826b7063ca934a799f191a14797e05f/raw/83192b8d1359b96a6989c3c001306b028baf861a/prompt-voice.txt"
+
 # Active client sessions
 active_sessions = {}
 
@@ -112,7 +116,21 @@ async def websocket_endpoint(websocket: WebSocket):
     handler = AudioSessionHandler(websocket)
     await handler.start_session()
 
-# Remove the PROMPT_URL and load_prompt() function since we'll get it from frontend
+# Fetch the prompt content
+def load_prompt():
+    try:
+        with urllib.request.urlopen(PROMPT_URL) as response:
+            prompt_text = response.read().decode()
+            print(f"Successfully loaded prompt: {len(prompt_text)} characters")
+            return prompt_text
+    except Exception as e:
+        print(f"Error loading prompt: {e}")
+        return ""
+
+# Load the prompt at startup
+INITIAL_PROMPT = load_prompt()
+
+# Basic Gemini configuration
 CONFIG = types.LiveConnectConfig(
     response_modalities=["audio"],
     speech_config=types.SpeechConfig(
@@ -141,6 +159,7 @@ class AudioSessionHandler:
     def __init__(self, websocket):
         self.session_id = str(uuid.uuid4())[:8]  # Generate short unique session ID
         self.websocket = websocket
+        # Get current API key at session initialization
         self.api_key = get_current_api_key()
         if RANDOM_KEY_PER_SESSION:
             print(f"[{self.session_id}] Using random API key for new session")
@@ -153,27 +172,61 @@ class AudioSessionHandler:
         self.audio_chunks = []
         self.buffer_size = 0
         self.max_buffer_size = 192000
-        self.initial_prompt = None  # Will be set by frontend
+        self.initial_prompt = None  # Will be set after receiving config
+        self.prompt_url = PROMPT_URL  # Default prompt URL
         self.connection_closed = False  # Flag to track WebSocket connection state
+        self.config_received = False  # Flag to track if we've received config
         
         # Register this session
         active_sessions[self.session_id] = self
         print(f"New session created: {self.session_id}, Total active sessions: {len(active_sessions)}")
-        
+
+    async def handle_config_message(self, message_data):
+        if 'promptUrl' in message_data:
+            self.prompt_url = message_data['promptUrl']
+            print(f"[{self.session_id}] Using custom prompt URL: {self.prompt_url}")
+            self.initial_prompt = await self.load_prompt_async()
+            self.config_received = True
+        else:
+            print(f"[{self.session_id}] No custom prompt URL provided, using default")
+            self.initial_prompt = INITIAL_PROMPT
+            self.config_received = True
+
+    async def load_prompt_async(self):
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(self.prompt_url) as response:
+                    prompt_text = await response.text()
+                    print(f"[{self.session_id}] Successfully loaded prompt: {len(prompt_text)} characters")
+                    return prompt_text
+        except Exception as e:
+            print(f"[{self.session_id}] Error loading prompt: {e}")
+            return INITIAL_PROMPT  # Fallback to default prompt
+
     async def start_session(self):
         try:
+            # Wait for initial config message or timeout after 10 seconds
+            try:
+                while not self.config_received and not self.connection_closed:
+                    message = await asyncio.wait_for(self.websocket.receive_json(), timeout=10.0)
+                    if message.get('type') == 'config':
+                        await self.handle_config_message(message)
+                        break
+            except asyncio.TimeoutError:
+                print(f"[{self.session_id}] No config received, using default prompt")
+                self.initial_prompt = INITIAL_PROMPT
+            except Exception as e:
+                print(f"[{self.session_id}] Error receiving config: {e}")
+                self.initial_prompt = INITIAL_PROMPT
+
             # Connect to the Gemini API using proper async with syntax
             print(f"[{self.session_id}] Connecting to Gemini API")
             async with self.client.aio.live.connect(model=MODEL, config=CONFIG) as session:
                 self.session = session
                 print(f"[{self.session_id}] Successfully connected to Gemini API")
                 
-                # Wait for initial prompt from frontend before proceeding
-                while not self.initial_prompt and not self.connection_closed:
-                    await asyncio.sleep(0.1)
-                
                 # Send initial prompt if available
-                if self.initial_prompt and not self.connection_closed:
+                if self.initial_prompt:
                     print(f"[{self.session_id}] Sending initial prompt to Gemini")
                     try:
                         await self.session.send(input=self.initial_prompt, end_of_turn=True)
@@ -182,16 +235,9 @@ class AudioSessionHandler:
                         print(f"[{self.session_id}] Error with session.send + end_of_turn: {e}")
                         try:
                             await self.session.send(input=self.initial_prompt)
-                            print(f"[{self.session_id}] Used session.send without end_of_turn")
                         except Exception as e2:
-                            print(f"[{self.session_id}] Error with simple session.send: {e2}")
-                            try:
-                                await self.session.send_client_content(self.initial_prompt)
-                                print(f"[{self.session_id}] Used session.send_client_content")
-                            except Exception as e3:
-                                print(f"[{self.session_id}] Failed to send initial prompt: {e3}")
-                
-                # Send status message to client
+                            print(f"[{self.session_id}] Error sending prompt: {e2}")
+                # Send status message to client - FIX HERE: use send_text for FastAPI WebSocket
                 await self.safe_send_text(json.dumps({
                     "type": "status",
                     "data": f"Connected to Dr. Healio (Session: {self.session_id})"
@@ -238,21 +284,10 @@ class AudioSessionHandler:
     async def process_browser_messages(self):
         try:
             while self.running and self.session and not self.connection_closed:
-                # Get message from browser
+                # Get message from browser - FIX HERE: use receive_text for FastAPI WebSocket
                 message = await self.websocket.receive_text()
                 data = json.loads(message)
                 
-                if data["type"] == "initial_prompt":
-                    # Store the initial prompt
-                    self.initial_prompt = data["data"]
-                    print(f"[{self.session_id}] Received initial prompt from frontend")
-                    # Send acknowledgment back to frontend
-                    await self.safe_send_text(json.dumps({
-                        "type": "status",
-                        "data": "Initial prompt received"
-                    }))
-                    continue
-                    
                 if data["type"] == "audio":
                     # Process audio from browser
                     audio_bytes = base64.b64decode(data["data"])
@@ -553,8 +588,6 @@ if __name__ == "__main__":
     print(f"API key rotation settings:")
     print(f"  - Random key per session: {'Enabled' if RANDOM_KEY_PER_SESSION else 'Disabled'}")
     print(f"  - Rotation interval: {ROTATION_INTERVAL} seconds ({ROTATION_INTERVAL/60} minutes)")
-    port = int(os.environ.get("PORT", 8080))
-    uvicorn.run("HealioVoice:app", host="0.0.0.0", port=port, reload=False)
     
     # Start websocket server in a separate thread (including API key rotation)
     websocket_thread = threading.Thread(target=lambda: asyncio.run(main()), daemon=True)
