@@ -561,6 +561,8 @@ if __name__ == "__main__":
     print(f"API key rotation settings:")
     print(f"  - Random key per session: {'Enabled' if RANDOM_KEY_PER_SESSION else 'Disabled'}")
     print(f"  - Rotation interval: {ROTATION_INTERVAL} seconds ({ROTATION_INTERVAL/60} minutes)")
+    port = int(os.environ.get("PORT", 8080))
+    uvicorn.run("HealioVoice:app", host="0.0.0.0", port=port, reload=False)
     
     # Start websocket server in a separate thread (including API key rotation)
     websocket_thread = threading.Thread(target=lambda: asyncio.run(main()), daemon=True)
