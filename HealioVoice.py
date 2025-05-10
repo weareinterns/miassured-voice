@@ -82,9 +82,6 @@ def get_random_api_key():
 # Model and config
 MODEL = "models/gemini-2.0-flash-live-001"
 
-# Initial prompt URL
-PROMPT_URL = "https://gist.githubusercontent.com/shudveta/6826b7063ca934a799f191a14797e05f/raw/83192b8d1359b96a6989c3c001306b028baf861a/prompt-voice.txt"
-
 # Active client sessions
 active_sessions = {}
 
@@ -115,20 +112,6 @@ async def websocket_endpoint(websocket: WebSocket):
     print("WebSocket connection accepted at /ws endpoint")
     handler = AudioSessionHandler(websocket)
     await handler.start_session()
-
-# Fetch the prompt content
-def load_prompt():
-    try:
-        with urllib.request.urlopen(PROMPT_URL) as response:
-            prompt_text = response.read().decode()
-            print(f"Successfully loaded prompt: {len(prompt_text)} characters")
-            return prompt_text
-    except Exception as e:
-        print(f"Error loading prompt: {e}")
-        return ""
-
-# Load the prompt at startup
-INITIAL_PROMPT = load_prompt()
 
 # Basic Gemini configuration
 CONFIG = types.LiveConnectConfig(
@@ -172,7 +155,7 @@ class AudioSessionHandler:
         self.audio_chunks = []
         self.buffer_size = 0
         self.max_buffer_size = 192000
-        self.initial_prompt = INITIAL_PROMPT  # Default prompt
+        self.initial_prompt = None  # Must be set via config
         self.connection_closed = False  # Flag to track WebSocket connection state
         self.config_received = False  # Flag to track if we've received config
         
@@ -181,28 +164,50 @@ class AudioSessionHandler:
         print(f"New session created: {self.session_id}, Total active sessions: {len(active_sessions)}")
 
     async def handle_config_message(self, message_data):
-        if 'prompt' in message_data:
+        if 'prompt' in message_data and message_data['prompt'].strip():
             self.initial_prompt = message_data['prompt']
-            print(f"[{self.session_id}] Using custom prompt: {len(self.initial_prompt)} characters")
+            print(f"[{self.session_id}] Received prompt: {len(self.initial_prompt)} characters")
             self.config_received = True
         else:
-            print(f"[{self.session_id}] No custom prompt provided, using default")
-            self.initial_prompt = INITIAL_PROMPT
-            self.config_received = True
+            print(f"[{self.session_id}] No prompt provided in config message")
+            await self.safe_send_text(json.dumps({
+                "type": "error",
+                "data": "A prompt is required to start the session"
+            }))
+            self.connection_closed = True
 
     async def start_session(self):
         try:
-            # Wait for initial config message or timeout after 10 seconds
+            # Wait for initial config message with prompt
             try:
                 while not self.config_received and not self.connection_closed:
-                    message = await asyncio.wait_for(self.websocket.receive_json(), timeout=10.0)
+                    message = await asyncio.wait_for(self.websocket.receive_json(), timeout=30.0)
                     if message.get('type') == 'config':
                         await self.handle_config_message(message)
+                        if not self.config_received:  # If no valid prompt was provided
+                            return
                         break
             except asyncio.TimeoutError:
-                print(f"[{self.session_id}] No config received, using default prompt")
+                print(f"[{self.session_id}] No prompt received within timeout period")
+                await self.safe_send_text(json.dumps({
+                    "type": "error",
+                    "data": "Session timeout: No prompt received"
+                }))
+                return
             except Exception as e:
                 print(f"[{self.session_id}] Error receiving config: {e}")
+                await self.safe_send_text(json.dumps({
+                    "type": "error",
+                    "data": "Error starting session: Invalid configuration"
+                }))
+                return
+
+            if not self.initial_prompt:  # Double check we have a prompt
+                await self.safe_send_text(json.dumps({
+                    "type": "error",
+                    "data": "Cannot start session without a prompt"
+                }))
+                return
 
             # Connect to the Gemini API using proper async with syntax
             print(f"[{self.session_id}] Connecting to Gemini API")
@@ -210,19 +215,24 @@ class AudioSessionHandler:
                 self.session = session
                 print(f"[{self.session_id}] Successfully connected to Gemini API")
                 
-                # Send initial prompt if available
-                if self.initial_prompt:
-                    print(f"[{self.session_id}] Sending initial prompt to Gemini")
+                # Send the prompt
+                print(f"[{self.session_id}] Sending prompt to Gemini")
+                try:
+                    await self.session.send(input=self.initial_prompt, end_of_turn=True)
+                    print(f"[{self.session_id}] Used session.send with end_of_turn")
+                except TypeError as e:
+                    print(f"[{self.session_id}] Error with session.send + end_of_turn: {e}")
                     try:
-                        await self.session.send(input=self.initial_prompt, end_of_turn=True)
-                        print(f"[{self.session_id}] Used session.send with end_of_turn")
-                    except TypeError as e:
-                        print(f"[{self.session_id}] Error with session.send + end_of_turn: {e}")
-                        try:
-                            await self.session.send(input=self.initial_prompt)
-                        except Exception as e2:
-                            print(f"[{self.session_id}] Error sending prompt: {e2}")
-                # Send status message to client
+                        await self.session.send(input=self.initial_prompt)
+                    except Exception as e2:
+                        print(f"[{self.session_id}] Error sending prompt: {e2}")
+                        await self.safe_send_text(json.dumps({
+                            "type": "error",
+                            "data": "Failed to initialize AI with prompt"
+                        }))
+                        return
+
+                # Send success status message to client
                 await self.safe_send_text(json.dumps({
                     "type": "status",
                     "data": f"Connected to Dr. Healio (Session: {self.session_id})"
