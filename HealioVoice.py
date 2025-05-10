@@ -81,9 +81,6 @@ def get_random_api_key():
 # Model and config
 MODEL = "models/gemini-2.0-flash-live-001"
 
-# Initial prompt URL
-PROMPT_URL = "https://gist.githubusercontent.com/shudveta/6826b7063ca934a799f191a14797e05f/raw/83192b8d1359b96a6989c3c001306b028baf861a/prompt-voice.txt"
-
 # Active client sessions
 active_sessions = {}
 
@@ -115,21 +112,7 @@ async def websocket_endpoint(websocket: WebSocket):
     handler = AudioSessionHandler(websocket)
     await handler.start_session()
 
-# Fetch the prompt content
-def load_prompt():
-    try:
-        with urllib.request.urlopen(PROMPT_URL) as response:
-            prompt_text = response.read().decode()
-            print(f"Successfully loaded prompt: {len(prompt_text)} characters")
-            return prompt_text
-    except Exception as e:
-        print(f"Error loading prompt: {e}")
-        return ""
-
-# Load the prompt at startup
-INITIAL_PROMPT = load_prompt()
-
-# Basic Gemini configuration
+# Remove the PROMPT_URL and load_prompt() function since we'll get it from frontend
 CONFIG = types.LiveConnectConfig(
     response_modalities=["audio"],
     speech_config=types.SpeechConfig(
@@ -158,7 +141,6 @@ class AudioSessionHandler:
     def __init__(self, websocket):
         self.session_id = str(uuid.uuid4())[:8]  # Generate short unique session ID
         self.websocket = websocket
-        # Get current API key at session initialization
         self.api_key = get_current_api_key()
         if RANDOM_KEY_PER_SESSION:
             print(f"[{self.session_id}] Using random API key for new session")
@@ -171,7 +153,7 @@ class AudioSessionHandler:
         self.audio_chunks = []
         self.buffer_size = 0
         self.max_buffer_size = 192000
-        self.initial_prompt = INITIAL_PROMPT
+        self.initial_prompt = None  # Will be set by frontend
         self.connection_closed = False  # Flag to track WebSocket connection state
         
         # Register this session
@@ -186,31 +168,30 @@ class AudioSessionHandler:
                 self.session = session
                 print(f"[{self.session_id}] Successfully connected to Gemini API")
                 
+                # Wait for initial prompt from frontend before proceeding
+                while not self.initial_prompt and not self.connection_closed:
+                    await asyncio.sleep(0.1)
+                
                 # Send initial prompt if available
-                if self.initial_prompt:
+                if self.initial_prompt and not self.connection_closed:
                     print(f"[{self.session_id}] Sending initial prompt to Gemini")
-                    # Fix for the API method issue - use try/except for each possible method
                     try:
-                        # Try to send as plain input with end_of_turn parameter
                         await self.session.send(input=self.initial_prompt, end_of_turn=True)
                         print(f"[{self.session_id}] Used session.send with end_of_turn")
                     except TypeError as e:
                         print(f"[{self.session_id}] Error with session.send + end_of_turn: {e}")
-                        # Try without end_of_turn parameter
                         try:
                             await self.session.send(input=self.initial_prompt)
                             print(f"[{self.session_id}] Used session.send without end_of_turn")
                         except Exception as e2:
                             print(f"[{self.session_id}] Error with simple session.send: {e2}")
-                            # Last resort - try different methods
                             try:
                                 await self.session.send_client_content(self.initial_prompt)
                                 print(f"[{self.session_id}] Used session.send_client_content")
                             except Exception as e3:
                                 print(f"[{self.session_id}] Failed to send initial prompt: {e3}")
-                    self.initial_prompt = ""  # Clear prompt after sending
                 
-                # Send status message to client - FIX HERE: use send_text for FastAPI WebSocket
+                # Send status message to client
                 await self.safe_send_text(json.dumps({
                     "type": "status",
                     "data": f"Connected to Dr. Healio (Session: {self.session_id})"
@@ -257,10 +238,21 @@ class AudioSessionHandler:
     async def process_browser_messages(self):
         try:
             while self.running and self.session and not self.connection_closed:
-                # Get message from browser - FIX HERE: use receive_text for FastAPI WebSocket
+                # Get message from browser
                 message = await self.websocket.receive_text()
                 data = json.loads(message)
                 
+                if data["type"] == "initial_prompt":
+                    # Store the initial prompt
+                    self.initial_prompt = data["data"]
+                    print(f"[{self.session_id}] Received initial prompt from frontend")
+                    # Send acknowledgment back to frontend
+                    await self.safe_send_text(json.dumps({
+                        "type": "status",
+                        "data": "Initial prompt received"
+                    }))
+                    continue
+                    
                 if data["type"] == "audio":
                     # Process audio from browser
                     audio_bytes = base64.b64decode(data["data"])
